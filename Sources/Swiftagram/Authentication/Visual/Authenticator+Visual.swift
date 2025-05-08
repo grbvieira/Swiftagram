@@ -11,11 +11,11 @@ import Foundation
 import UIKit
 import WebKit
 
-import ComposableStorage
+import Requests
+import Storages
 
 public extension Authenticator.Group {
     /// A `struct` defining an authenticator relying on `WKWebView`s to log in.
-    @available(iOS 11.0, macOS 10.13, macCatalyst 13.0, *)
     struct Visual: CustomClientAuthentication {
         /// The underlying authenticator.
         public let authenticator: Authenticator
@@ -37,40 +37,42 @@ public extension Authenticator.Group {
         /// Authenticate the given user.
         ///
         /// - parameter client: A valid `Client`.
-        /// - returns: A valid `Publisher`.
-        public func authenticate(in client: Client) -> AnyPublisher<Secret, Swift.Error> {
-            Deferred {
-                Future<Void, Never> { resolve in
-                    // Delete all instagram records.
-                    let store = WKWebsiteDataStore.default()
+        /// - returns: Some `SingleEndpoint`.
+        public func authenticate(in client: Client) -> AnySingleEndpoint<Secret> {
+            Static {
+                // Delete all instagram records.
+                let store = WKWebsiteDataStore.default()
+                await withUnsafeContinuation { continuation in
                     store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) {
-                        let instagramRecords = $0.filter { $0.displayName.contains("instagram") }
-                        store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: instagramRecords) {
-                            resolve(.success(()))
+                        let records = $0.filter { $0.displayName.contains("instagram") }
+                        store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: records) {
+                            continuation.resume()
                         }
                     }
                 }
-                .setFailureType(to: Swift.Error.self)
-                .flatMap {
-                    Future<AuthenticatorWebView, Swift.Error> { resolve in
-                        // Prepare the actual `WebView`.
-                        let webView = AuthenticatorWebView(client: client)
-                        self.transformer(webView) {
-                            guard let url = URL(string: "https://www.instagram.com/accounts/login/") else {
-                                return resolve(.failure(Authenticator.Error.invalidURL))
-                            }
-                            webView.load(.init(url: url))
-                            resolve(.success(webView))
+            }.switch {
+                // Prepare the actual web view.
+                let webView: AuthenticatorWebView = .init(client: client)
+                try await withCheckedThrowingContinuation { continuation in
+                    transformer(webView) {
+                        guard let url = URL(string: "https://www.instagram.com/accounts/login/") else {
+                            return continuation.resume(with: .failure(Authentication.Error.invalidURL))
                         }
+                        webView.load(.init(url: url))
+                        continuation.resume(with: .success(webView))
                     }
                 }
-                .flatMap(\.secret)
-                .tryMap { try AnyStorage<Secret>.store($0, in: self.authenticator.storage) }
-            }
-            .subscribe(on: RunLoop.main)
-            .receive(on: RunLoop.main)
-            .prefix(1)
-            .eraseToAnyPublisher()
+            }.switch { webView in
+                // Add the actual completion handler.
+                try await withCheckedThrowingContinuation { continuation in
+                    webView.completion = {
+                        // Store inside the selected storage.
+                        AnyStorage<Secret>.store($0, in: authenticator.storage)
+                        // Return.
+                        continuation.resume(with: $0)
+                    }
+                }
+            }.eraseToAnySingleEndpoint()
         }
     }
 }
